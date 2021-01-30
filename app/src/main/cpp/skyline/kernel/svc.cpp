@@ -257,6 +257,7 @@ namespace skyline::kernel::svc {
             state.ctx->gpr.w1 = thread->handle;
             state.ctx->gpr.w0 = Result{};
         } else {
+            state.logger->Debug("svcCreateThread: Cannot create thread (Entry Point: 0x{:X}, Argument: 0x{:X}, Stack Pointer: 0x{:X}, Priority: {}, Ideal Core: {})", entry, entryArgument, stackTop, priority, idealCore);
             state.ctx->gpr.w1 = 0;
             state.ctx->gpr.w0 = result::OutOfResource;
         }
@@ -336,7 +337,7 @@ namespace skyline::kernel::svc {
 
     void SetThreadPriority(const DeviceState &state) {
         KHandle handle{state.ctx->gpr.w0};
-        u32 priority{state.ctx->gpr.w1};
+        u8 priority{static_cast<u8>(state.ctx->gpr.w1)};
         if (!state.process->npdm.threadInfo.priority.Valid(priority)) {
             state.logger->Warn("svcSetThreadPriority: 'priority' invalid: 0x{:X}", priority);
             state.ctx->gpr.w0 = result::InvalidPriority;
@@ -346,7 +347,14 @@ namespace skyline::kernel::svc {
             auto thread{state.process->GetHandle<type::KThread>(handle)};
             state.logger->Debug("svcSetThreadPriority: Setting thread #{}'s priority to {}", thread->id, priority);
             if (thread->priority != priority) {
-                thread->priority = priority;
+                thread->basePriority = priority;
+                u8 newPriority{};
+                do {
+                    // Try to CAS the priority of the thread with it's new base priority
+                    // If the new priority is equivalent to the current priority then we don't need to CAS
+                    newPriority = thread->priority.load();
+                    newPriority = std::min(newPriority, priority);
+                } while (newPriority != priority && thread->priority.compare_exchange_strong(newPriority, priority));
                 state.scheduler->UpdatePriority(thread);
             }
             state.ctx->gpr.w0 = Result{};
@@ -523,11 +531,8 @@ namespace skyline::kernel::svc {
             auto object{state.process->GetHandle(handle)};
             switch (object->objectType) {
                 case type::KType::KEvent:
-                    std::static_pointer_cast<type::KEvent>(object)->ResetSignal();
-                    break;
-
                 case type::KType::KProcess:
-                    std::static_pointer_cast<type::KProcess>(object)->ResetSignal();
+                    std::static_pointer_cast<type::KSyncObject>(object)->ResetSignal();
                     break;
 
                 default: {
@@ -551,17 +556,18 @@ namespace skyline::kernel::svc {
 
         u32 numHandles{state.ctx->gpr.w2};
         if (numHandles > maxSyncHandles) {
-            state.ctx->gpr.w0 = result::OutOfHandles;
+            state.ctx->gpr.w0 = result::OutOfRange;
             return;
         }
 
-        std::string handleStr;
-        std::vector<std::shared_ptr<type::KSyncObject>> objectTable;
         span waitHandles(reinterpret_cast<KHandle *>(state.ctx->gpr.x1), numHandles);
+        std::vector<std::shared_ptr<type::KSyncObject>> objectTable;
+        objectTable.reserve(numHandles);
 
+        std::string handleString;
         for (const auto &handle : waitHandles) {
             if (Logger::LogLevel::Debug <= state.logger->configLevel)
-                handleStr += fmt::format("* 0x{:X}\n", handle);
+                handleString += fmt::format("* 0x{:X}\n", handle);
 
             auto object{state.process->GetHandle(handle)};
             switch (object->objectType) {
@@ -573,46 +579,99 @@ namespace skyline::kernel::svc {
                     break;
 
                 default: {
+                    state.logger->Debug("svcWaitSynchronization: An invalid handle was supplied: 0x{:X}", handle);
                     state.ctx->gpr.w0 = result::InvalidHandle;
                     return;
                 }
             }
         }
 
-        u64 timeout{state.ctx->gpr.x3};
-        state.logger->Debug("svcWaitSynchronization: Waiting on handles:\n{}Timeout: 0x{:X} ns", handleStr, timeout);
+        i64 timeout{static_cast<i64>(state.ctx->gpr.x3)};
+        state.logger->Debug("svcWaitSynchronization: Waiting on handles:\n{}Timeout: {}ns", handleString, timeout);
 
-        SchedulerScopedLock schedulerLock(state);
-        auto start{util::GetTimeNs()};
-        while (true) {
-            if (state.thread->cancelSync) {
-                state.thread->cancelSync = false;
-                state.ctx->gpr.w0 = result::Cancelled;
+        std::unique_lock lock(type::KSyncObject::syncObjectMutex);
+        if (state.thread->cancelSync) {
+            state.thread->cancelSync = false;
+            state.ctx->gpr.w0 = result::Cancelled;
+            return;
+        }
+
+        u32 index{};
+        for (const auto &object : objectTable) {
+            if (object->signalled) {
+                state.logger->Debug("svcWaitSynchronization: Signalled handle: 0x{:X}", waitHandles[index]);
+                state.ctx->gpr.w0 = Result{};
+                state.ctx->gpr.w1 = index;
                 return;
             }
+            index++;
+        }
 
-            u32 index{};
-            for (const auto &object : objectTable) {
-                if (object->signalled) {
-                    state.logger->Debug("svcWaitSynchronization: Signalled handle: 0x{:X}", waitHandles[index]);
-                    state.ctx->gpr.w0 = Result{};
-                    state.ctx->gpr.w1 = index;
-                    return;
-                }
-                index++;
-            }
+        if (timeout == 0) {
+            state.logger->Debug("svcWaitSynchronization: No handle is currently signalled");
+            state.ctx->gpr.w0 = result::TimedOut;
+            return;
+        }
 
-            if ((util::GetTimeNs() - start) >= timeout) {
-                state.logger->Debug("svcWaitSynchronization: Wait has timed out");
-                state.ctx->gpr.w0 = result::TimedOut;
-                return;
-            }
+        auto priority{state.thread->priority.load()};
+        for (const auto &object : objectTable)
+            object->syncObjectWaiters.insert(std::upper_bound(object->syncObjectWaiters.begin(), object->syncObjectWaiters.end(), priority, type::KThread::IsHigherPriority), state.thread);
+
+        state.thread->isCancellable = true;
+        state.thread->wakeObject = nullptr;
+        state.scheduler->RemoveThread();
+
+        lock.unlock();
+        if (timeout > 0)
+            state.scheduler->TimedWaitSchedule(std::chrono::nanoseconds(timeout));
+        else
+            state.scheduler->WaitSchedule(false);
+        lock.lock();
+
+        state.thread->isCancellable = false;
+        auto wakeObject{state.thread->wakeObject};
+
+        u32 wakeIndex{};
+        index = 0;
+        for (const auto &object : objectTable) {
+            if (object.get() == wakeObject)
+                wakeIndex = index;
+
+            auto it{std::find(object->syncObjectWaiters.begin(), object->syncObjectWaiters.end(), state.thread)};
+            if (it != object->syncObjectWaiters.end())
+                object->syncObjectWaiters.erase(it);
+            else
+                throw exception("svcWaitSynchronization: An object (0x{:X}) has been removed from the syncObjectWaiters queue incorrectly", waitHandles[index]);
+
+            index++;
+        }
+
+        if (wakeObject) {
+            state.logger->Debug("svcWaitSynchronization: Signalled handle: 0x{:X}", waitHandles[wakeIndex]);
+            state.ctx->gpr.w0 = Result{};
+            state.ctx->gpr.w1 = wakeIndex;
+        } else if (state.thread->cancelSync) {
+            state.thread->cancelSync = false;
+            state.logger->Debug("svcWaitSynchronization: Wait has been cancelled");
+            state.ctx->gpr.w0 = result::Cancelled;
+        } else {
+            state.logger->Debug("svcWaitSynchronization: Wait has timed out");
+            state.ctx->gpr.w0 = result::TimedOut;
+            lock.unlock();
+            state.scheduler->InsertThread(state.thread);
+            state.scheduler->WaitSchedule();
         }
     }
 
     void CancelSynchronization(const DeviceState &state) {
         try {
-            state.process->GetHandle<type::KThread>(state.ctx->gpr.w0)->cancelSync = true;
+            std::unique_lock lock(type::KSyncObject::syncObjectMutex);
+            auto thread{state.process->GetHandle<type::KThread>(state.ctx->gpr.w0)};
+            thread->cancelSync = true;
+            if (thread->isCancellable) {
+                thread->isCancellable = false;
+                state.scheduler->InsertThread(thread);
+            }
         } catch (const std::out_of_range &) {
             state.logger->Warn("svcCancelSynchronization: 'handle' invalid: 0x{:X}", static_cast<u32>(state.ctx->gpr.w0));
             state.ctx->gpr.w0 = result::InvalidHandle;
@@ -721,6 +780,7 @@ namespace skyline::kernel::svc {
     }
 
     void SendSyncRequest(const DeviceState &state) {
+        SchedulerScopedLock schedulerLock(state);
         state.os->serviceManager.SyncRequestHandler(static_cast<KHandle>(state.ctx->gpr.x0));
         state.ctx->gpr.w0 = Result{};
     }
@@ -735,13 +795,26 @@ namespace skyline::kernel::svc {
         state.ctx->gpr.w0 = Result{};
     }
 
+    void Break(const DeviceState &state) {
+        auto reason{state.ctx->gpr.x0};
+        if (reason & (1ULL << 31)) {
+            state.logger->Error("svcBreak: Debugger is being engaged ({})", reason);
+            __builtin_trap();
+        } else {
+            state.logger->Error("svcBreak: Stack Trace ({}){}", reason, state.loader->GetStackTrace());
+            if (state.thread->id)
+                state.process->Kill(false);
+            std::longjmp(state.thread->originalCtx, true);
+        }
+    }
+
     void OutputDebugString(const DeviceState &state) {
-        auto debug{span(reinterpret_cast<u8 *>(state.ctx->gpr.x0), state.ctx->gpr.x1).as_string()};
+        auto string{span(reinterpret_cast<u8 *>(state.ctx->gpr.x0), state.ctx->gpr.x1).as_string()};
 
-        if (debug.back() == '\n')
-            debug.remove_suffix(1);
+        if (string.back() == '\n')
+            string.remove_suffix(1);
 
-        state.logger->Info("svcOutputDebugString: {}", debug);
+        state.logger->Info("svcOutputDebugString: {}", string);
         state.ctx->gpr.w0 = Result{};
     }
 
@@ -864,7 +937,7 @@ namespace skyline::kernel::svc {
                 break;
 
             case InfoState::UserExceptionContextAddr:
-                out = reinterpret_cast<u64>(state.process->tlsPages[0]->Get(0));
+                out = reinterpret_cast<u64>(state.process->tlsExceptionContext);
                 break;
 
             default:

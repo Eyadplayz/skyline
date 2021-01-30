@@ -10,26 +10,59 @@ namespace skyline::signal {
     thread_local std::exception_ptr SignalExceptionPtr;
 
     void ExceptionThrow() {
-        std::rethrow_exception(SignalExceptionPtr);
+        // We need the compiler to not remove the asm at the end of 'std::rethrow_exception' which is a noreturn function
+        volatile bool alwaysTrue{true};
+        if (alwaysTrue)
+            std::rethrow_exception(SignalExceptionPtr);
     }
 
     std::terminate_handler terminateHandler{};
 
+    inline StackFrame *SafeFrameRecurse(size_t depth, StackFrame *frame) {
+        if (frame) {
+            for (size_t it{}; it < depth; it++) {
+                if (frame->lr && frame->next)
+                    frame = frame->next;
+                else
+                    terminateHandler();
+            }
+        } else {
+            terminateHandler();
+        }
+        return frame;
+    }
+
     void TerminateHandler() {
         auto exception{std::current_exception()};
         if (terminateHandler && exception && exception == SignalExceptionPtr) {
-            struct StackFrame {
-                StackFrame *next;
-                void *lr;
-            } *frame;
-
+            StackFrame *frame;
             asm("MOV %0, FP" : "=r"(frame));
-            frame = frame->next->next;
+            frame = SafeFrameRecurse(2, frame); // We unroll past 'std::terminate'
 
-            if (_Unwind_FindEnclosingFunction(frame->lr) == &ExceptionThrow) // We're in a loop, skip past a frame
-                frame = frame->next->next;
-            else if (_Unwind_FindEnclosingFunction(frame->next->next->next->next->next->lr) == &ExceptionThrow) // We're in a deeper loop, just terminate
-                frame = frame->next->next->next->next->next->next->next;
+            static void *exceptionThrowEnd{};
+            if (!exceptionThrowEnd) {
+                u32 *it{reinterpret_cast<u32 *>(&ExceptionThrow) + 1};
+                while (_Unwind_FindEnclosingFunction(it) == &ExceptionThrow)
+                    it++;
+                exceptionThrowEnd = it - 1;
+            }
+
+            auto lookupFrame{frame};
+            bool hasAdvanced{};
+            while (lookupFrame && lookupFrame->lr) {
+                if (lookupFrame->lr >= reinterpret_cast<void *>(&ExceptionThrow) && lookupFrame->lr < exceptionThrowEnd) {
+                    if (!hasAdvanced) {
+                        frame = SafeFrameRecurse(2, lookupFrame);
+                        hasAdvanced = true;
+                    } else {
+                        terminateHandler(); // We have no handler to consume the exception, it's time to quit
+                    }
+                }
+                lookupFrame = lookupFrame->next;
+            }
+
+            if (!frame->next)
+                terminateHandler(); // We don't know the frame's stack boundaries, the only option is to quit
 
             asm("MOV SP, %x0\n\t" // Stack frame is the first item on a function's stack, it's used to calculate calling function's stack pointer
                 "MOV LR, %x1\n\t"
@@ -49,6 +82,14 @@ namespace skyline::signal {
         signalException.pc = reinterpret_cast<void *>(context->uc_mcontext.pc);
         if (signal == SIGSEGV)
             signalException.fault = info->si_addr;
+
+        signalException.frames.push_back(reinterpret_cast<void *>(context->uc_mcontext.pc));
+        StackFrame *frame{reinterpret_cast<StackFrame *>(context->uc_mcontext.regs[29])};
+        while (frame && frame->lr) {
+            signalException.frames.push_back(frame->lr);
+            frame = frame->next;
+        }
+
         SignalExceptionPtr = std::make_exception_ptr(signalException);
         context->uc_mcontext.pc = reinterpret_cast<u64>(&ExceptionThrow);
 
@@ -109,7 +150,7 @@ namespace skyline::signal {
 
     thread_local std::array<SignalHandler, NSIG> ThreadSignalHandlers{};
 
-    __attribute__((no_stack_protector)) // Stack protector stores data in TLS at the function epilog and verifies it at the prolog, we cannot allow writes to guest TLS and may switch to an alternative TLS during the signal handler and have disabled the stack protector as a result
+    __attribute__((no_stack_protector)) // Stack protector stores data in TLS at the function epilogue and verifies it at the prolog, we cannot allow writes to guest TLS and may switch to an alternative TLS during the signal handler and have disabled the stack protector as a result
     void ThreadSignalHandler(int signal, siginfo *info, ucontext *context) {
         void *tls{}; // The TLS value prior to being restored if it is
         if (TlsRestorer)
@@ -128,18 +169,18 @@ namespace skyline::signal {
             asm volatile("MSR TPIDR_EL0, %x0"::"r"(tls));
     }
 
-    void SetSignalHandler(std::initializer_list<int> signals, SignalHandler function) {
+    void SetSignalHandler(std::initializer_list<int> signals, SignalHandler function, bool syscallRestart) {
         static std::array<std::once_flag, NSIG> signalHandlerOnce{};
 
         stack_t stack;
         sigaltstack(nullptr, &stack);
         struct sigaction action{
             .sa_sigaction = reinterpret_cast<void (*)(int, siginfo *, void *)>(ThreadSignalHandler),
-            .sa_flags = SA_RESTART | SA_SIGINFO | (stack.ss_sp && stack.ss_size ? SA_ONSTACK : 0),
+            .sa_flags = (syscallRestart ? SA_RESTART : 0) | SA_SIGINFO | (stack.ss_sp && stack.ss_size ? SA_ONSTACK : 0),
         };
 
         for (int signal : signals) {
-            std::call_once(signalHandlerOnce[signal], [signal, action]() {
+            std::call_once(signalHandlerOnce[signal], [signal, &action]() {
                 struct sigaction oldAction;
                 Sigaction(signal, &action, &oldAction);
                 if (oldAction.sa_flags && oldAction.sa_flags != action.sa_flags)

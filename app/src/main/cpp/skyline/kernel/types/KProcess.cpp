@@ -10,19 +10,9 @@ namespace skyline::kernel::type {
     KProcess::TlsPage::TlsPage(const std::shared_ptr<KPrivateMemory> &memory) : memory(memory) {}
 
     u8 *KProcess::TlsPage::ReserveSlot() {
-        if (Full())
-            throw exception("Trying to reserve TLS slot in full page");
-        return Get(index++);
-    }
-
-    u8 *KProcess::TlsPage::Get(u8 slot) {
-        if (slot >= constant::TlsSlots)
-            throw exception("TLS slot is out of range");
-        return memory->ptr + (constant::TlsSlotSize * slot);
-    }
-
-    bool KProcess::TlsPage::Full() {
-        return index == constant::TlsSlots;
+        if (index == constant::TlsSlots)
+            return nullptr;
+        return memory->ptr + (constant::TlsSlotSize * index++);
     }
 
     KProcess::KProcess(const DeviceState &state) : memory(state), KSyncObject(state, KType::KProcess) {}
@@ -52,22 +42,23 @@ namespace skyline::kernel::type {
         }
     }
 
-    void KProcess::InitializeHeap() {
+    void KProcess::InitializeHeapTls() {
         constexpr size_t DefaultHeapSize{0x200000};
-        heap = heap.make_shared(state, reinterpret_cast<u8 *>(state.process->memory.heap.address), DefaultHeapSize, memory::Permission{true, true, false}, memory::states::Heap);
+        heap = std::make_shared<KPrivateMemory>(state, reinterpret_cast<u8 *>(state.process->memory.heap.address), DefaultHeapSize, memory::Permission{true, true, false}, memory::states::Heap);
         InsertItem(heap); // Insert it into the handle table so GetMemoryObject will contain it
+        tlsExceptionContext = AllocateTlsSlot();
     }
 
     u8 *KProcess::AllocateTlsSlot() {
+        std::lock_guard lock(tlsMutex);
+        u8 *slot;
         for (auto &tlsPage: tlsPages)
-            if (!tlsPage->Full())
-                return tlsPage->ReserveSlot();
+            if ((slot = tlsPage->ReserveSlot()))
+                return slot;
 
-        u8 *ptr = tlsPages.empty() ? reinterpret_cast<u8 *>(state.process->memory.tlsIo.address) : ((*(tlsPages.end() - 1))->memory->ptr + PAGE_SIZE);
-        auto tlsPage{std::make_shared<TlsPage>(std::make_shared<KPrivateMemory>(state, ptr, PAGE_SIZE, memory::Permission(true, true, false), memory::states::ThreadLocal))};
+        slot = tlsPages.empty() ? reinterpret_cast<u8 *>(memory.tlsIo.address) : ((*(tlsPages.end() - 1))->memory->ptr + PAGE_SIZE);
+        auto tlsPage{std::make_shared<TlsPage>(std::make_shared<KPrivateMemory>(state, slot, PAGE_SIZE, memory::Permission(true, true, false), memory::states::ThreadLocal))};
         tlsPages.push_back(tlsPage);
-
-        tlsPage->ReserveSlot(); // User-mode exception handling
         return tlsPage->ReserveSlot();
     }
 
@@ -76,7 +67,7 @@ namespace skyline::kernel::type {
         if (disableThreadCreation)
             return nullptr;
         if (!stackTop && threads.empty()) { //!< Main thread stack is created by the kernel and owned by the process
-            mainThreadStack = mainThreadStack.make_shared(state, reinterpret_cast<u8 *>(state.process->memory.stack.address), state.process->npdm.meta.mainThreadStackSize, memory::Permission{true, true, false}, memory::states::Stack);
+            mainThreadStack = std::make_shared<KPrivateMemory>(state, reinterpret_cast<u8 *>(state.process->memory.stack.address), state.process->npdm.meta.mainThreadStackSize, memory::Permission{true, true, false}, memory::states::Stack);
             if (mprotect(mainThreadStack->ptr, PAGE_SIZE, PROT_NONE))
                 throw exception("Failed to create guard page for thread stack at 0x{:X}", mainThreadStack->ptr);
             stackTop = mainThreadStack->ptr + mainThreadStack->size;
@@ -146,7 +137,7 @@ namespace skyline::kernel::type {
                 u8 priority, ownerPriority;
                 do {
                     // Try to CAS the priority of the owner with the current thread
-                    // If they're equivalent then we don't need to CAS as the priority won't be inherited
+                    // If the new priority is equivalent to the current priority then we don't need to CAS
                     ownerPriority = owner->priority.load();
                     priority = std::min(ownerPriority, state.thread->priority.load());
                 } while (ownerPriority != priority && owner->priority.compare_exchange_strong(ownerPriority, priority));
@@ -207,13 +198,21 @@ namespace skyline::kernel::type {
 
             if (!waiters.empty()) {
                 // If there are threads still waiting on us then try to inherit their priority
-                auto highestPriority{waiters.front()};
-                u8 priority, ownerPriority;
+                auto highestPriorityThread{waiters.front()};
+                u8 newPriority, basePriority;
                 do {
-                    ownerPriority = state.thread->priority.load();
-                    priority = std::min(ownerPriority, highestPriority->priority.load());
-                } while (ownerPriority != priority && nextOwner->priority.compare_exchange_strong(ownerPriority, priority));
+                    basePriority = state.thread->basePriority.load();
+                    newPriority = std::min(basePriority, highestPriorityThread->priority.load());
+                } while (basePriority != newPriority && state.thread->priority.compare_exchange_strong(basePriority, newPriority));
                 state.scheduler->UpdatePriority(state.thread);
+            } else {
+                u8 priority, basePriority;
+                do {
+                    basePriority = state.thread->basePriority.load();
+                    priority = state.thread->priority.load();
+                } while (priority != basePriority && !state.thread->priority.compare_exchange_strong(priority, basePriority));
+                if (priority != basePriority)
+                    state.scheduler->UpdatePriority(state.thread);
             }
 
             if (nextWaiter) {
