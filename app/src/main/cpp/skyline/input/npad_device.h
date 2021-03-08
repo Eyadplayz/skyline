@@ -65,7 +65,7 @@ namespace skyline::input {
     };
 
     /**
-     * @brief A handle to a specific device addressed by it's ID and type
+     * @brief A handle to a specific device addressed by its ID and type
      * @note This is used by both Six-Axis and Vibration
      */
     union __attribute__((__packed__)) NpadDeviceHandle {
@@ -89,8 +89,9 @@ namespace skyline::input {
                     return NpadControllerType::JoyconLeft;
                 case 7:
                     return NpadControllerType::JoyconRight;
+                default:
+                    return NpadControllerType::None;
             }
-            return NpadControllerType::None;
         }
     };
 
@@ -105,6 +106,8 @@ namespace skyline::input {
         float frequencyLow;
         float amplitudeHigh;
         float frequencyHigh;
+
+        constexpr bool operator==(const NpadVibrationValue &) const = default;
     };
     static_assert(sizeof(NpadVibrationValue) == 0x10);
 
@@ -128,7 +131,7 @@ namespace skyline::input {
         NpadControllerState &GetNextEntry(NpadControllerInfo &info);
 
         /**
-         * @return The NpadControllerInfo for this controller based on it's type
+         * @return The NpadControllerInfo for this controller based on its type
          */
         NpadControllerInfo &GetControllerInfo();
 
@@ -144,11 +147,11 @@ namespace skyline::input {
 
         NpadDevice(NpadManager &manager, NpadSection &section, NpadId id);
 
-        inline void SetAssignment(NpadJoyAssignment assignment) {
+        void SetAssignment(NpadJoyAssignment assignment) {
             section.header.assignment = assignment;
         }
 
-        inline NpadJoyAssignment GetAssignment() {
+        NpadJoyAssignment GetAssignment() {
             return section.header.assignment;
         }
 

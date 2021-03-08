@@ -16,6 +16,7 @@ namespace skyline::vfs {
         crypto::KeyStore::Key128 ctr;
         crypto::AesCipher cipher;
         std::shared_ptr<Backing> backing;
+        std::mutex mutex; //!< Synchronize all AES-CTR cipher state modifications
         size_t baseOffset; //!< The offset of the backing into the file is used to calculate the IV
 
         /**
@@ -23,9 +24,10 @@ namespace skyline::vfs {
          */
         void UpdateCtr(u64 offset);
 
-      public:
-        CtrEncryptedBacking(crypto::KeyStore::Key128 &ctr, crypto::KeyStore::Key128 &key, const std::shared_ptr<Backing> &backing, size_t baseOffset);
+      protected:
+        size_t ReadImpl(span<u8> output, size_t offset) override;
 
-        size_t Read(span<u8> output, size_t offset = 0) override;
+      public:
+        CtrEncryptedBacking(crypto::KeyStore::Key128 ctr, crypto::KeyStore::Key128 key, std::shared_ptr<Backing> backing, size_t baseOffset);
     };
 }

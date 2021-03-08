@@ -5,7 +5,7 @@
 #include "partition_filesystem.h"
 
 namespace skyline::vfs {
-    PartitionFileSystem::PartitionFileSystem(std::shared_ptr<Backing> backing) : FileSystem(), backing(backing) {
+    PartitionFileSystem::PartitionFileSystem(const std::shared_ptr<Backing> &backing) : FileSystem(), backing(backing) {
         header = backing->Read<FsHeader>();
 
         if (header.magic == util::MakeMagic<u32>("PFS0"))
@@ -27,11 +27,11 @@ namespace skyline::vfs {
             auto entry{backing->Read<PartitionFileEntry>(entryOffset)};
 
             std::string name(&stringTable[entry.stringTableOffset]);
-            fileMap.emplace(name, std::move(entry));
+            fileMap.emplace(name, entry);
         }
     }
 
-    std::shared_ptr<Backing> PartitionFileSystem::OpenFile(const std::string &path, Backing::Mode mode) {
+    std::shared_ptr<Backing> PartitionFileSystem::OpenFileImpl(const std::string &path, Backing::Mode mode) {
         try {
             auto &entry{fileMap.at(path)};
             return std::make_shared<RegionBacking>(backing, fileDataOffset + entry.offset, entry.size, mode);
@@ -40,16 +40,16 @@ namespace skyline::vfs {
         }
     }
 
-    std::optional<Directory::EntryType> PartitionFileSystem::GetEntryType(const std::string &path) {
+    std::optional<Directory::EntryType> PartitionFileSystem::GetEntryTypeImpl(const std::string &path) {
         if (fileMap.count(path))
             return Directory::EntryType::File;
 
         return std::nullopt;
     }
 
-    std::shared_ptr<Directory> PartitionFileSystem::OpenDirectory(const std::string &path, Directory::ListMode listMode) {
+    std::shared_ptr<Directory> PartitionFileSystem::OpenDirectoryImpl(const std::string &path, Directory::ListMode listMode) {
         // PFS doesn't have directories
-        if (path != "")
+        if (!path.empty())
             return nullptr;
 
         std::vector<Directory::Entry> fileList;
@@ -59,7 +59,7 @@ namespace skyline::vfs {
         return std::make_shared<PartitionFileSystemDirectory>(fileList, listMode);
     }
 
-    PartitionFileSystemDirectory::PartitionFileSystemDirectory(const std::vector<Entry> &fileList, ListMode listMode) : Directory(listMode), fileList(fileList) {}
+    PartitionFileSystemDirectory::PartitionFileSystemDirectory(std::vector<Entry> fileList, ListMode listMode) : Directory(listMode), fileList(std::move(fileList)) {}
 
     std::vector<Directory::Entry> PartitionFileSystemDirectory::Read() {
         if (listMode.file)

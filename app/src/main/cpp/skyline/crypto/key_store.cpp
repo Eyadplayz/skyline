@@ -35,7 +35,12 @@ namespace skyline::crypto {
     void KeyStore::PopulateTitleKeys(std::string_view keyName, std::string_view value) {
         Key128 key{util::HexStringToArray<16>(keyName)};
         Key128 valueArray{util::HexStringToArray<16>(value)};
-        titleKeys.insert({std::move(key), std::move(valueArray)});
+        titleKeys.emplace(key, valueArray);
+    }
+
+    void KeyStore::PopulateTitleKey(Key128 keyName, Key128 value) {
+        if (!titleKeys.contains(keyName))
+            titleKeys.emplace(keyName, value);
     }
 
     void KeyStore::PopulateKeys(std::string_view keyName, std::string_view value) {

@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <list>
 #include <vfs/npdm.h>
 #include "KThread.h"
 #include "KTransferMemory.h"
@@ -15,7 +14,6 @@ namespace skyline {
         constexpr u16 TlsSlotSize{0x200}; //!< The size of a single TLS slot
         constexpr u8 TlsSlots{PAGE_SIZE / TlsSlotSize}; //!< The amount of TLS slots in a single page
         constexpr KHandle BaseHandleIndex{0xD000}; //!< The index of the base handle
-        constexpr u32 MtxOwnerMask{0xBFFFFFFF}; //!< The mask of values which contain the owner of a mutex
     }
 
     namespace kernel::type {
@@ -27,25 +25,13 @@ namespace skyline {
             MemoryManager memory;
 
           private:
-            struct WaitStatus {
-                std::atomic_bool flag{false};
-                i8 priority;
-                KHandle handle;
-                u32 *mutex{};
-
-                WaitStatus(i8 priority, KHandle handle);
-
-                WaitStatus(i8 priority, KHandle handle, u32 *mutex);
-            };
-
-            std::unordered_map<u64, std::vector<std::shared_ptr<WaitStatus>>> mutexes; //!< A map from a mutex's address to a vector of Mutex objects for threads waiting on it
-            std::unordered_map<u64, std::list<std::shared_ptr<WaitStatus>>> conditionals; //!< A map from a conditional variable's address to a vector of threads waiting on it
-            std::mutex mutexLock;
-            std::mutex conditionalLock;
-
             std::mutex threadMutex; //!< Synchronizes thread creation to prevent a race between thread creation and thread killing
-            bool disableThreadCreation{}; //!< If to disable thread creation, we use this to prevent thread creation after all threads have been killed
+            bool disableThreadCreation{}; //!< Whether to disable thread creation, we use this to prevent thread creation after all threads have been killed
             std::vector<std::shared_ptr<KThread>> threads;
+
+            using SyncWaiters = std::multimap<void *, std::shared_ptr<KThread>>;
+            std::mutex syncWaiterMutex; //!< Synchronizes all mutations to the map to prevent races
+            SyncWaiters syncWaiters; //!< All threads waiting on process-wide synchronization primitives (Atomic keys + Address Arbiter)
 
             /**
             * @brief The status of a single TLS page (A page is 4096 bytes on ARMv8)
@@ -55,21 +41,23 @@ namespace skyline {
             */
             struct TlsPage {
                 u8 index{}; //!< The slots are assigned sequentially, this holds the index of the last TLS slot reserved
-                std::shared_ptr<KPrivateMemory> memory;
+                std::shared_ptr<KPrivateMemory> memory; //!< A single page sized memory allocation for this TLS page
 
-                TlsPage(const std::shared_ptr<KPrivateMemory> &memory);
+                TlsPage(std::shared_ptr<KPrivateMemory> memory);
 
+                /**
+                 * @return A non-null pointer to a TLS page slot on success, a nullptr will be returned if this page is full
+                 * @note This function is not thread-safe and should be called exclusively by one thread at a time
+                 */
                 u8 *ReserveSlot();
-
-                u8 *Get(u8 index);
-
-                bool Full();
             };
 
           public:
-            std::shared_ptr<KPrivateMemory> mainThreadStack;
+            u8 *tlsExceptionContext{}; //!< A pointer to the TLS exception handling context slot
+            std::mutex tlsMutex; //!< A mutex to synchronize allocation of TLS pages to prevent extra pages from being created
+            std::vector<std::shared_ptr<TlsPage>> tlsPages; //!< All TLS pages allocated by this process
+            std::shared_ptr<KPrivateMemory> mainThreadStack; //!< The stack memory of the main thread stack is owned by the KProcess itself
             std::shared_ptr<KPrivateMemory> heap;
-            std::vector<std::shared_ptr<TlsPage>> tlsPages;
             vfs::NPDM npdm;
 
           private:
@@ -84,17 +72,18 @@ namespace skyline {
             /**
              * @brief Kill the main thread/all running threads in the process in a graceful manner
              * @param join Return after the main thread has joined rather than instantly
-             * @param all If to kill all running threads or just the main thread
-             * @param disableCreation If to disable further thread creation
+             * @param all Whether to kill all running threads or just the main thread
+             * @param disableCreation Whether to disable further thread creation
              * @note If there are no threads then this will silently return
              * @note The main thread should eventually kill the rest of the threads itself
              */
             void Kill(bool join, bool all = false, bool disableCreation = false);
 
             /**
+             * @brief This initializes the process heap and TLS Error Context slot pointer, it should be called prior to creating the first thread
              * @note This requires VMM regions to be initialized, it will map heap at an arbitrary location otherwise
              */
-            void InitializeHeap();
+            void InitializeHeapTls();
 
             /**
              * @return A 0x200 TLS slot allocated inside the TLS/IO region
@@ -105,7 +94,7 @@ namespace skyline {
              * @return A shared pointer to a KThread initialized with the specified values or nullptr, if thread creation has been disabled
              * @note The default values are for the main thread and will use values from the NPDM
              */
-            std::shared_ptr<KThread> CreateThread(void *entry, u64 argument = 0, void *stackTop = nullptr, i8 priority = -1, i8 idealCore = -1);
+            std::shared_ptr<KThread> CreateThread(void *entry, u64 argument = 0, void *stackTop = nullptr, std::optional<u8> priority = std::nullopt, std::optional<u8> idealCore = std::nullopt);
 
             /**
             * @brief The output for functions that return created kernel objects
@@ -118,10 +107,10 @@ namespace skyline {
             };
 
             /**
-            * @brief Creates a new handle to a KObject and adds it to the process handle_table
-            * @tparam objectClass The class of the kernel object to create
-            * @param args The arguments for the kernel object except handle, pid and state
-            */
+             * @brief Creates a new handle to a KObject and adds it to the process handle_table
+             * @tparam objectClass The class of the kernel object to create
+             * @param args The arguments for the kernel object except handle, pid and state
+             */
             template<typename objectClass, typename ...objectArgs>
             HandleOut<objectClass> NewHandle(objectArgs... args) {
                 std::unique_lock lock(handleMutex);
@@ -136,9 +125,9 @@ namespace skyline {
             }
 
             /**
-            * @brief Inserts an item into the process handle table
-            * @return The handle of the corresponding item in the handle table
-            */
+             * @brief Inserts an item into the process handle table
+             * @return The handle of the corresponding item in the handle table
+             */
             template<typename objectClass>
             KHandle InsertItem(std::shared_ptr<objectClass> &item) {
                 std::unique_lock lock(handleMutex);
@@ -190,54 +179,59 @@ namespace skyline {
 
             template<>
             std::shared_ptr<KObject> GetHandle<KObject>(KHandle handle) {
-                return handles.at(handle - constant::BaseHandleIndex);
+                std::shared_lock lock(handleMutex);
+                auto &item{handles.at(handle - constant::BaseHandleIndex)};
+                if (item != nullptr)
+                    return item;
+                else
+                    throw std::out_of_range(fmt::format("GetHandle was called with a deleted handle: 0x{:X}", handle));
             }
 
             /**
-            * @brief Retrieves a kernel memory object that owns the specified address
-            * @param address The address to look for
-            * @return A shared pointer to the corresponding KMemory object
-            */
+             * @brief Retrieves a kernel memory object that owns the specified address
+             * @param address The address to look for
+             * @return A shared pointer to the corresponding KMemory object
+             */
             std::optional<HandleOut<KMemory>> GetMemoryObject(u8 *ptr);
 
             /**
              * @brief Closes a handle in the handle table
              */
-            inline void CloseHandle(KHandle handle) {
+            void CloseHandle(KHandle handle) {
                 handles.at(handle - constant::BaseHandleIndex) = nullptr;
             }
 
             /**
-            * @brief Locks the Mutex at the specified address
-            * @param owner The handle of the current mutex owner
-            * @return If the mutex was successfully locked
-            */
-            bool MutexLock(u32 *mutex, KHandle owner);
-
-            /**
-            * @brief Unlocks the Mutex at the specified address
-            * @return If the mutex was successfully unlocked
-            */
-            bool MutexUnlock(u32 *mutex);
-
-            /**
-            * @param timeout The amount of time to wait for the conditional variable
-            * @return If the conditional variable was successfully waited for or timed out
-            */
-            bool ConditionalVariableWait(void *conditional, u32 *mutex, u64 timeout);
-
-            /**
-            * @brief Signals a number of conditional variable waiters
-            * @param amount The amount of waiters to signal
-            */
-            void ConditionalVariableSignal(void *conditional, u64 amount);
-
-            /**
-             * @brief Resets the object to an unsignalled state
+             * @brief Locks the mutex at the specified address
+             * @param ownerHandle The psuedo-handle of the current mutex owner
+             * @param tag The handle of the thread which is requesting this lock
              */
-            inline void ResetSignal() {
-                signalled = false;
-            }
+            Result MutexLock(u32 *mutex, KHandle ownerHandle, KHandle tag);
+
+            /**
+             * @brief Unlocks the mutex at the specified address
+             */
+            void MutexUnlock(u32 *mutex);
+
+            /**
+             * @brief Waits on the conditional variable at the specified address
+             */
+            Result ConditionalVariableWait(u32 *key, u32 *mutex, KHandle tag, i64 timeout);
+
+            /**
+             * @brief Signals the conditional variable at the specified address
+             */
+            void ConditionalVariableSignal(u32 *key, i32 amount);
+
+            /**
+             * @brief Waits on the supplied address with the specified arbitration function
+             */
+            Result WaitForAddress(u32 *address, u32 value, i64 timeout, bool(*arbitrationFunction)(u32 *address, u32 value));
+
+            /**
+             * @brief Signals a variable amount of waiters at the supplied address
+             */
+            Result SignalToAddress(u32 *address, u32 value, i32 amount, bool(*mutateFunction)(u32 *address, u32 value, u32 waiterCount) = nullptr);
         };
     }
 }

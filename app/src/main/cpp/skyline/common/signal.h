@@ -7,6 +7,37 @@
 
 namespace skyline::signal {
     /**
+     * @brief The structure of a stack frame entry in the ARMv8 ABI
+     */
+    struct StackFrame {
+        StackFrame *next;
+        void *lr;
+    };
+
+    /**
+     * @brief A scoped way to block a stack trace beyond the scope of this object
+     * @note This is used for JNI functions where the stack trace will be determined as they often contain invalid stack frames which'd cause a SIGSEGV
+     */
+    struct ScopedStackBlocker {
+        StackFrame realFrame;
+
+        __attribute__((noinline)) ScopedStackBlocker() {
+            StackFrame *frame;
+            asm("MOV %0, FP" : "=r"(frame));
+            realFrame = *frame;
+            frame->next = nullptr;
+            frame->lr = nullptr;
+        }
+
+        __attribute__((noinline)) ~ScopedStackBlocker() {
+            StackFrame *frame;
+            asm("MOV %0, FP" : "=r"(frame));
+            frame->next = realFrame.next;
+            frame->lr = realFrame.lr;
+        }
+    };
+
+    /**
      * @brief An exception object that is designed specifically to hold Linux signals
      * @note This doesn't inherit std::exception as it shouldn't be caught as such
      * @note Refer to the manpage siginfo(3) for information on members
@@ -14,10 +45,11 @@ namespace skyline::signal {
     class SignalException {
       public:
         int signal{};
-        void* pc{};
+        void *pc{};
         void *fault{};
+        std::vector<void *> frames; //!< A vector of all stack frame entries prior to the signal occuring
 
-        inline std::string what() const {
+        std::string what() const {
             if (!fault)
                 return fmt::format("Signal: {} (PC: 0x{:X})", strsignal(signal), reinterpret_cast<uintptr_t>(pc));
             else
@@ -48,12 +80,13 @@ namespace skyline::signal {
     /**
      * @brief A wrapper around Sigaction to make it easy to set a sigaction signal handler for multiple signals and also allow for thread-local signal handlers
      * @param function A sa_action callback with a pointer to the old TLS (If present) as the 4th argument
+     * @param syscallRestart If a system call running during the signal will be seamlessly restarted or return an error (Corresponds to SA_RESTART)
      * @note If 'nullptr' is written into the 4th argument then the old TLS won't be restored or it'll be set to any non-null value written into it
      */
-    void SetSignalHandler(std::initializer_list<int> signals, SignalHandler function);
+    void SetSignalHandler(std::initializer_list<int> signals, SignalHandler function, bool syscallRestart = true);
 
-    inline void SetSignalHandler(std::initializer_list<int> signals, void (*function)(int, struct siginfo *, ucontext *)) {
-        SetSignalHandler(signals, reinterpret_cast<SignalHandler>(function));
+    inline void SetSignalHandler(std::initializer_list<int> signals, void (*function)(int, struct siginfo *, ucontext *), bool syscallRestart = true) {
+        SetSignalHandler(signals, reinterpret_cast<SignalHandler>(function), syscallRestart);
     }
 
     /**

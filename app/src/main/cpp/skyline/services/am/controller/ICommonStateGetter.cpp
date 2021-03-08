@@ -7,12 +7,12 @@
 
 namespace skyline::service::am {
     void ICommonStateGetter::QueueMessage(ICommonStateGetter::Message message) {
-        messageQueue.emplace(message);
+        messageQueue.emplace_back(message);
         messageEvent->Signal();
     }
 
-    ICommonStateGetter::ICommonStateGetter(const DeviceState &state, ServiceManager &manager) : messageEvent(std::make_shared<type::KEvent>(state)), BaseService(state, manager) {
-        operationMode = static_cast<OperationMode>(state.settings->GetBool("operation_mode"));
+    ICommonStateGetter::ICommonStateGetter(const DeviceState &state, ServiceManager &manager) : messageEvent(std::make_shared<type::KEvent>(state, false)), BaseService(state, manager) {
+        operationMode = static_cast<OperationMode>(state.settings->operationMode);
         state.logger->Info("Switch to mode: {}", static_cast<bool>(operationMode) ? "Docked" : "Handheld");
         QueueMessage(Message::FocusStateChange);
     }
@@ -29,7 +29,11 @@ namespace skyline::service::am {
             return result::NoMessages;
 
         response.Push(messageQueue.front());
-        messageQueue.pop();
+        messageQueue.pop_front();
+
+        if (messageQueue.empty())
+            messageEvent->ResetSignal();
+
         return {};
     }
 

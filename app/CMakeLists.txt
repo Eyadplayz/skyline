@@ -1,11 +1,11 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.16)
 project(Skyline LANGUAGES CXX ASM VERSION 0.3)
 
-set(BUILD_TESTS OFF)
-set(BUILD_TESTING OFF)
+set(BUILD_TESTS OFF CACHE BOOL "Build Tests" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "Build Testing" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build Shared Libraries" FORCE)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 
 set(source_DIR ${CMAKE_SOURCE_DIR}/src/main/cpp)
@@ -13,18 +13,21 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-strict-aliasing")
 set(CMAKE_CXX_FLAGS_RELEASE "-Ofast -flto=full -fno-stack-protector -Wno-unused-command-line-argument")
 if (uppercase_CMAKE_BUILD_TYPE STREQUAL "RELEASE")
     add_compile_definitions(NDEBUG)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif ()
 
-set(CMAKE_POLICY_DEFAULT_CMP0048 OLD)
-add_subdirectory("libraries/tinyxml2")
 add_subdirectory("libraries/fmt")
+
 add_subdirectory("libraries/oboe")
-add_subdirectory("libraries/lz4/contrib/cmake_unofficial")
-include_directories("libraries/lz4/lib")
 include_directories("libraries/oboe/include")
+
+set(LZ4_BUILD_CLI OFF CACHE BOOL "Build LZ4 CLI" FORCE)
+add_subdirectory("libraries/lz4/build/cmake")
+include_directories("libraries/lz4/lib")
+
 include_directories("libraries/vkhpp/include")
+include_directories("libraries/pugixml/src") # We use PugiXML in header-only mode
 include_directories("libraries/frozen/include")
-set(CMAKE_POLICY_DEFAULT_CMP0048 NEW)
 
 find_package(mbedtls REQUIRED CONFIG)
 
@@ -41,12 +44,14 @@ add_library(skyline SHARED
         ${source_DIR}/skyline/jvm.cpp
         ${source_DIR}/skyline/os.cpp
         ${source_DIR}/skyline/kernel/memory.cpp
+        ${source_DIR}/skyline/kernel/scheduler.cpp
         ${source_DIR}/skyline/kernel/ipc.cpp
         ${source_DIR}/skyline/kernel/svc.cpp
         ${source_DIR}/skyline/kernel/types/KProcess.cpp
         ${source_DIR}/skyline/kernel/types/KThread.cpp
         ${source_DIR}/skyline/kernel/types/KSharedMemory.cpp
         ${source_DIR}/skyline/kernel/types/KPrivateMemory.cpp
+        ${source_DIR}/skyline/kernel/types/KSyncObject.cpp
         ${source_DIR}/skyline/audio.cpp
         ${source_DIR}/skyline/audio/track.cpp
         ${source_DIR}/skyline/audio/resampler.cpp
@@ -67,6 +72,7 @@ add_library(skyline SHARED
         ${source_DIR}/skyline/loader/nro.cpp
         ${source_DIR}/skyline/loader/nso.cpp
         ${source_DIR}/skyline/loader/nca.cpp
+        ${source_DIR}/skyline/loader/xci.cpp
         ${source_DIR}/skyline/loader/nsp.cpp
         ${source_DIR}/skyline/vfs/os_filesystem.cpp
         ${source_DIR}/skyline/vfs/partition_filesystem.cpp
@@ -76,6 +82,7 @@ add_library(skyline SHARED
         ${source_DIR}/skyline/vfs/nacp.cpp
         ${source_DIR}/skyline/vfs/npdm.cpp
         ${source_DIR}/skyline/vfs/nca.cpp
+        ${source_DIR}/skyline/vfs/ticket.cpp
         ${source_DIR}/skyline/services/serviceman.cpp
         ${source_DIR}/skyline/services/base_service.cpp
         ${source_DIR}/skyline/services/common/parcel.cpp
@@ -161,7 +168,6 @@ add_library(skyline SHARED
         ${source_DIR}/skyline/services/ssl/ISslContext.cpp
         ${source_DIR}/skyline/services/prepo/IPrepoService.cpp
         )
-
-target_link_libraries(skyline vulkan android fmt tinyxml2 oboe lz4_static mbedtls::mbedcrypto)
-set(CMAKE_CXX17_EXTENSION_COMPILE_OPTION "-std=c++2a")
-target_compile_options(skyline PRIVATE -Wno-c++17-extensions -Wall -Wno-reorder -Wno-missing-braces -Wno-unused-variable -Wno-unused-private-field)
+# target_precompile_headers(skyline PRIVATE ${source_DIR}/skyline/common.h) # PCH will currently break Intellisense
+target_link_libraries(skyline vulkan android fmt lz4_static oboe mbedtls::mbedcrypto)
+target_compile_options(skyline PRIVATE -Wall -Wno-unknown-attributes -Wno-c++20-extensions -Wno-c++17-extensions -Wno-c99-designator -Wno-reorder -Wno-missing-braces -Wno-unused-variable -Wno-unused-private-field)

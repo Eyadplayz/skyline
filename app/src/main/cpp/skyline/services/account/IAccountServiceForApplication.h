@@ -21,13 +21,9 @@ namespace skyline {
             u64 upper; //!< The upper 64 bits of the user ID
             u64 lower; //!< The lower 64 bits of the user ID
 
-            constexpr bool operator==(const UserId &userId) {
-                return upper == userId.upper && lower == userId.lower;
-            }
+            constexpr bool operator==(const UserId &userId) const = default;
 
-            constexpr bool operator!=(const UserId &userId) {
-                return !(*this == userId);
-            }
+            constexpr bool operator!=(const UserId &userId) const = default;
         };
 
         /**

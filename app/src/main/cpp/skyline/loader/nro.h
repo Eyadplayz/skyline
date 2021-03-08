@@ -48,7 +48,7 @@ namespace skyline::loader {
 
         /**
          * @brief The asset section was created by homebrew developers to store additional data for their applications to use
-         * @note This would actually be retrieved by NRO homebrew by reading the NRO file itself (reading it's own binary) but libnx homebrew wrongly detects the images to be running in NSO mode where the RomFS is handled by HOS, this allows us to just provide the parsed data from the asset section to it directly
+         * @note This would actually be retrieved by NRO homebrew by reading the NRO file itself (reading its own binary) but libnx homebrew wrongly detects the images to be running in NSO mode where the RomFS is handled by HOS, this allows us to just provide the parsed data from the asset section to it directly
          */
         struct NroAssetHeader {
             u32 magic; //!< "ASET"
@@ -68,10 +68,10 @@ namespace skyline::loader {
         std::vector<u8> GetSegment(const NroSegmentHeader &segment);
 
       public:
-        NroLoader(const std::shared_ptr<vfs::Backing> &backing);
+        NroLoader(std::shared_ptr<vfs::Backing> backing);
 
-        std::vector<u8> GetIcon();
+        std::vector<u8> GetIcon() override;
 
-        void *LoadProcessData(const std::shared_ptr<kernel::type::KProcess> process, const DeviceState &state);
+        void *LoadProcessData(const std::shared_ptr<kernel::type::KProcess> &process, const DeviceState &state) override;
     };
 }

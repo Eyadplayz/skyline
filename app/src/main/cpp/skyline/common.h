@@ -6,7 +6,9 @@
 #include <map>
 #include <unordered_map>
 #include <span>
+#include <list>
 #include <vector>
+#include <span>
 #include <fstream>
 #include <mutex>
 #include <shared_mutex>
@@ -18,6 +20,7 @@
 #include <string>
 #include <sstream>
 #include <memory>
+#include <compare>
 #include <sys/mman.h>
 #include <fmt/format.h>
 #include <frozen/unordered_map.h>
@@ -66,14 +69,11 @@ namespace skyline {
         };
 
         /**
-         * @note Success is 0, 0 - it is the only error that's not specific to a module
+         * @note Success is 0, it's the only result that's not specific to a module
          */
         Result() = default;
 
-        constexpr Result(u16 module, u16 id) {
-            this->module = module;
-            this->id = id;
-        }
+        constexpr Result(u16 module, u16 id) : module(module), id(id) {}
 
         constexpr operator u32() const {
             return raw;
@@ -118,7 +118,7 @@ namespace skyline {
          * @param args The arguments based on format_str
          */
         template<typename S, typename... Args>
-        inline exception(const S &formatStr, Args &&... args) : runtime_error(fmt::format(formatStr, util::FmtCast(args)...)) {}
+        exception(const S &formatStr, Args &&... args) : runtime_error(fmt::format(formatStr, util::FmtCast(args)...)) {}
     };
 
     namespace util {
@@ -291,13 +291,13 @@ namespace skyline {
         using std::span<T, Extent>::span;
         using std::span<T, Extent>::operator=;
 
-        typedef typename std::span<T, Extent>::element_type elementType;
-        typedef typename std::span<T, Extent>::index_type indexType;
+        typedef typename std::span<T, Extent>::element_type element_type;
+        typedef typename std::span<T, Extent>::size_type size_type;
 
         constexpr span(const std::span<T, Extent> &spn) : std::span<T, Extent>(spn) {}
 
         /**
-         * @brief We want to support implicitly casting from std::string_view -> span as it is just a specialization of a data view which span is a generic form of, the opposite doesn't hold true as not all data held by a span is string data therefore the conversion isn't implicit there
+         * @brief We want to support implicitly casting from std::string_view -> span as it's just a specialization of a data view which span is a generic form of, the opposite doesn't hold true as not all data held by a span is string data therefore the conversion isn't implicit there
          */
         template<typename Traits>
         constexpr span(const std::basic_string_view<T, Traits> &string) : std::span<T, Extent>(const_cast<T *>(string.data()), string.size()) {}
@@ -328,7 +328,7 @@ namespace skyline {
          * @param amount The amount of elements that need to be copied (in terms of the supplied span), 0 will try to copy the entirety of the other span
          */
         template<typename In, size_t InExtent>
-        constexpr void copy_from(const span<In, InExtent> spn, indexType amount = 0) {
+        constexpr void copy_from(const span<In, InExtent> spn, size_type amount = 0) {
             auto size{amount ? amount * sizeof(In) : spn.size_bytes()};
             if (span::size_bytes() < size)
                 throw exception("Data being copied is larger than this span");
@@ -339,7 +339,7 @@ namespace skyline {
          * @brief Implicit type conversion for copy_from, this allows passing in std::vector/std::array in directly is automatically passed by reference which is important for any containers
          */
         template<typename In>
-        constexpr void copy_from(const In &in, indexType amount = 0) {
+        constexpr void copy_from(const In &in, size_type amount = 0) {
             copy_from(span<typename std::add_const<typename In::value_type>::type>(in), amount);
         }
 
@@ -354,11 +354,11 @@ namespace skyline {
             return std::span<T, Extent>::template last<Count>();
         }
 
-        constexpr span<elementType, std::dynamic_extent> first(indexType count) const noexcept {
+        constexpr span<element_type, std::dynamic_extent> first(size_type count) const noexcept {
             return std::span<T, Extent>::first(count);
         }
 
-        constexpr span<elementType, std::dynamic_extent> last(indexType count) const noexcept {
+        constexpr span<element_type, std::dynamic_extent> last(size_type count) const noexcept {
             return std::span<T, Extent>::last(count);
         }
 
@@ -367,7 +367,7 @@ namespace skyline {
             return std::span<T, Extent>::template subspan<Offset, Count>();
         }
 
-        constexpr span<T, std::dynamic_extent> subspan(indexType offset, indexType count = std::dynamic_extent) const noexcept {
+        constexpr span<T, std::dynamic_extent> subspan(size_type offset, size_type count = std::dynamic_extent) const noexcept {
             return std::span<T, Extent>::subspan(offset, count);
         }
     };
@@ -428,41 +428,36 @@ namespace skyline {
          */
         void WriteHeader(const std::string &str);
 
-        void Write(LogLevel level, std::string str);
+        void Write(LogLevel level, const std::string &str);
 
         template<typename S, typename... Args>
-        inline void Error(const S &formatStr, Args &&... args) {
-            if (LogLevel::Error <= configLevel) {
+        void Error(const S &formatStr, Args &&... args) {
+            if (LogLevel::Error <= configLevel)
                 Write(LogLevel::Error, fmt::format(formatStr, util::FmtCast(args)...));
-            }
         }
 
         template<typename S, typename... Args>
-        inline void Warn(const S &formatStr, Args &&... args) {
-            if (LogLevel::Warn <= configLevel) {
+        void Warn(const S &formatStr, Args &&... args) {
+            if (LogLevel::Warn <= configLevel)
                 Write(LogLevel::Warn, fmt::format(formatStr, util::FmtCast(args)...));
-            }
         }
 
         template<typename S, typename... Args>
-        inline void Info(const S &formatStr, Args &&... args) {
-            if (LogLevel::Info <= configLevel) {
+        void Info(const S &formatStr, Args &&... args) {
+            if (LogLevel::Info <= configLevel)
                 Write(LogLevel::Info, fmt::format(formatStr, util::FmtCast(args)...));
-            }
         }
 
         template<typename S, typename... Args>
-        inline void Debug(const S &formatStr, Args &&... args) {
-            if (LogLevel::Debug <= configLevel) {
+        void Debug(const S &formatStr, Args &&... args) {
+            if (LogLevel::Debug <= configLevel)
                 Write(LogLevel::Debug, fmt::format(formatStr, util::FmtCast(args)...));
-            }
         }
 
         template<typename S, typename... Args>
-        inline void Verbose(const S &formatStr, Args &&... args) {
-            if (LogLevel::Verbose <= configLevel) {
+        void Verbose(const S &formatStr, Args &&... args) {
+            if (LogLevel::Verbose <= configLevel)
                 Write(LogLevel::Verbose, fmt::format(formatStr, util::FmtCast(args)...));
-            }
         }
     };
 
@@ -480,6 +475,7 @@ namespace skyline {
             class KProcess;
             class KThread;
         }
+        class Scheduler;
         class OS;
     }
     namespace audio {
@@ -506,6 +502,7 @@ namespace skyline {
         std::shared_ptr<gpu::GPU> gpu;
         std::shared_ptr<audio::Audio> audio;
         std::shared_ptr<nce::NCE> nce;
+        std::shared_ptr<kernel::Scheduler> scheduler;
         std::shared_ptr<kernel::type::KProcess> process;
         static thread_local inline std::shared_ptr<kernel::type::KThread> thread{}; //!< The KThread of the thread which accesses this object
         static thread_local inline nce::ThreadContext *ctx{}; //!< The context of the guest thread for the corresponding host thread

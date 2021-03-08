@@ -6,7 +6,7 @@
 #include "npad.h"
 
 namespace skyline::input {
-    NpadDevice::NpadDevice(NpadManager &manager, NpadSection &section, NpadId id) : manager(manager), section(section), id(id), updateEvent(std::make_shared<kernel::type::KEvent>(manager.state)) {}
+    NpadDevice::NpadDevice(NpadManager &manager, NpadSection &section, NpadId id) : manager(manager), section(section), id(id), updateEvent(std::make_shared<kernel::type::KEvent>(manager.state, false)) {}
 
     void NpadDevice::Connect(NpadControllerType newType) {
         if (type == newType) {
@@ -187,7 +187,7 @@ namespace skyline::input {
 
         info.header.timestamp = util::GetTimeTicks();
         info.header.entryCount = std::min(static_cast<u8>(info.header.entryCount + 1), constant::HidEntryCount);
-        info.header.maxEntry = constant::HidEntryCount - 1;
+        info.header.maxEntry = info.header.entryCount;
         info.header.currentEntry = (info.header.currentEntry != constant::HidEntryCount - 1) ? info.header.currentEntry + 1 : 0;
 
         auto &entry{info.state.at(info.header.currentEntry)};
@@ -425,10 +425,15 @@ namespace skyline::input {
     }
 
     void NpadDevice::Vibrate(bool isRight, const NpadVibrationValue &value) {
-        if (isRight)
+        if (isRight) {
+            if (vibrationRight && (*vibrationRight) == value)
+                return;
             vibrationRight = value;
-        else
+        } else {
+            if (vibrationLeft == value)
+                return;
             vibrationLeft = value;
+        }
 
         if (vibrationRight)
             Vibrate(vibrationLeft, *vibrationRight);
@@ -437,6 +442,12 @@ namespace skyline::input {
     }
 
     void NpadDevice::Vibrate(const NpadVibrationValue &left, const NpadVibrationValue &right) {
+        if (vibrationLeft == left && vibrationRight && (*vibrationRight) == right)
+            return;
+
+        vibrationLeft = left;
+        vibrationRight = right;
+
         if (partnerIndex == constant::NullIndex) {
             std::array<VibrationInfo, 4> vibrations{
                 VibrationInfo{left.frequencyLow, left.amplitudeLow * (constant::AmplitudeMax / 4)},

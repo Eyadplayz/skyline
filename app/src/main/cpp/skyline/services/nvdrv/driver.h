@@ -62,12 +62,12 @@ namespace skyline::service::nvdrv {
          * @return A shared pointer to the device
          */
         template<typename objectClass>
-        inline std::shared_ptr<objectClass> GetDevice(u32 fd) {
+        std::shared_ptr<objectClass> GetDevice(u32 fd) {
             return std::static_pointer_cast<objectClass>(GetDevice(fd));
         }
 
         /**
-         * @brief Closes the specified device with it's file descriptor
+         * @brief Closes the specified device with its file descriptor
          */
         void CloseDevice(u32 fd);
     };

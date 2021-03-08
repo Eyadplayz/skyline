@@ -5,9 +5,10 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <android/log.h>
-#include "skyline/loader/loader.h"
 #include "skyline/common.h"
+#include "skyline/common/signal.h"
 #include "skyline/common/settings.h"
+#include "skyline/loader/loader.h"
 #include "skyline/os.h"
 #include "skyline/jvm.h"
 #include "skyline/gpu.h"
@@ -21,6 +22,7 @@ std::weak_ptr<skyline::gpu::GPU> GpuWeak;
 std::weak_ptr<skyline::input::Input> InputWeak;
 
 extern "C" JNIEXPORT void Java_emu_skyline_EmulationActivity_executeApplication(JNIEnv *env, jobject instance, jstring romUriJstring, jint romType, jint romFd, jint preferenceFd, jstring appFilesPathJstring) {
+    skyline::signal::ScopedStackBlocker stackBlocker; // We do not want anything to unwind past JNI code as there are invalid stack frames which can lead to a segmentation fault
     Fps = FrameTime = 0;
 
     pthread_setname_np(pthread_self(), "EmuMain");
@@ -30,8 +32,7 @@ extern "C" JNIEXPORT void Java_emu_skyline_EmulationActivity_executeApplication(
     close(preferenceFd);
 
     auto appFilesPath{env->GetStringUTFChars(appFilesPathJstring, nullptr)};
-    auto logger{std::make_shared<skyline::Logger>(std::string(appFilesPath) + "skyline.log", static_cast<skyline::Logger::LogLevel>(std::stoi(settings->GetString("log_level"))))};
-    //settings->List(logger); // (Uncomment when you want to print out all settings strings)
+    auto logger{std::make_shared<skyline::Logger>(std::string(appFilesPath) + "skyline.log", settings->logLevel)};
 
     auto start{std::chrono::steady_clock::now()};
 
@@ -49,6 +50,8 @@ extern "C" JNIEXPORT void Java_emu_skyline_EmulationActivity_executeApplication(
 
         os->Execute(romFd, static_cast<skyline::loader::RomFormat>(romType));
     } catch (std::exception &e) {
+        logger->Error(e.what());
+    } catch (const skyline::signal::SignalException &e) {
         logger->Error(e.what());
     } catch (...) {
         logger->Error("An unknown exception has occurred");

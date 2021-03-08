@@ -97,7 +97,7 @@ namespace skyline::kernel::svc {
     void GetCurrentProcessorNumber(const DeviceState &state);
 
     /**
-     * @brief Clears a KEvent of it's signal
+     * @brief Resets a KEvent to its unsignalled state
      * @url https://switchbrew.org/wiki/SVC#ClearEvent
      */
     void ClearEvent(const DeviceState &state);
@@ -187,6 +187,12 @@ namespace skyline::kernel::svc {
     void GetThreadId(const DeviceState &state);
 
     /**
+     * @brief Causes the debugger to be engaged or the program to end if it isn't being debugged
+     * @url https://switchbrew.org/wiki/SVC#Break
+     */
+    void Break(const DeviceState &state);
+
+    /**
      * @brief Outputs a debug string
      * @url https://switchbrew.org/wiki/SVC#OutputDebugString
      */
@@ -209,6 +215,18 @@ namespace skyline::kernel::svc {
      * @url https://switchbrew.org/wiki/SVC#UnmapPhysicalMemory
      */
     void UnmapPhysicalMemory(const DeviceState &state);
+
+    /**
+     * @brief Waits on an address based on the value of the address
+     * @url https://switchbrew.org/wiki/SVC#WaitForAddress
+     */
+    void WaitForAddress(const DeviceState &state);
+
+    /**
+     * @brief Signals a thread which is waiting on an address
+     * @url https://switchbrew.org/wiki/SVC#SignalToAddress
+     */
+    void SignalToAddress(const DeviceState &state);
 
     /**
      * @brief The SVC Table maps all SVCs to their corresponding functions
@@ -252,7 +270,7 @@ namespace skyline::kernel::svc {
         nullptr, // 0x23
         nullptr, // 0x24
         GetThreadId, // 0x25
-        nullptr, // 0x26
+        Break, // 0x26
         OutputDebugString, // 0x27
         nullptr, // 0x28
         GetInfo, // 0x29
@@ -266,8 +284,8 @@ namespace skyline::kernel::svc {
         nullptr, // 0x31
         nullptr, // 0x32
         nullptr, // 0x33
-        nullptr, // 0x34
-        nullptr, // 0x35
+        WaitForAddress, // 0x34
+        SignalToAddress, // 0x35
         nullptr, // 0x36
         nullptr, // 0x37
         nullptr, // 0x38

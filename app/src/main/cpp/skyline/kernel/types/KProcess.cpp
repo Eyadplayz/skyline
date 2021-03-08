@@ -3,29 +3,17 @@
 
 #include <nce.h>
 #include <os.h>
+#include <kernel/results.h>
+
 #include "KProcess.h"
 
 namespace skyline::kernel::type {
-    KProcess::WaitStatus::WaitStatus(i8 priority, KHandle handle) : priority(priority), handle(handle) {}
-
-    KProcess::WaitStatus::WaitStatus(i8 priority, KHandle handle, u32 *mutex) : priority(priority), handle(handle), mutex(mutex) {}
-
-    KProcess::TlsPage::TlsPage(const std::shared_ptr<KPrivateMemory> &memory) : memory(memory) {}
+    KProcess::TlsPage::TlsPage(std::shared_ptr<KPrivateMemory> memory) : memory(std::move(memory)) {}
 
     u8 *KProcess::TlsPage::ReserveSlot() {
-        if (Full())
-            throw exception("Trying to reserve TLS slot in full page");
-        return Get(index++);
-    }
-
-    u8 *KProcess::TlsPage::Get(u8 index) {
-        if (index >= constant::TlsSlots)
-            throw exception("TLS slot is out of range");
-        return memory->ptr + (constant::TlsSlotSize * index);
-    }
-
-    bool KProcess::TlsPage::Full() {
-        return index == constant::TlsSlots;
+        if (index == constant::TlsSlots)
+            return nullptr;
+        return memory->ptr + (constant::TlsSlotSize * index++);
     }
 
     KProcess::KProcess(const DeviceState &state) : memory(state), KSyncObject(state, KType::KProcess) {}
@@ -55,36 +43,37 @@ namespace skyline::kernel::type {
         }
     }
 
-    void KProcess::InitializeHeap() {
+    void KProcess::InitializeHeapTls() {
         constexpr size_t DefaultHeapSize{0x200000};
-        heap = heap.make_shared(state, reinterpret_cast<u8 *>(state.process->memory.heap.address), DefaultHeapSize, memory::Permission{true, true, false}, memory::states::Heap);
+        heap = std::make_shared<KPrivateMemory>(state, reinterpret_cast<u8 *>(state.process->memory.heap.address), DefaultHeapSize, memory::Permission{true, true, false}, memory::states::Heap);
         InsertItem(heap); // Insert it into the handle table so GetMemoryObject will contain it
+        tlsExceptionContext = AllocateTlsSlot();
     }
 
     u8 *KProcess::AllocateTlsSlot() {
+        std::lock_guard lock(tlsMutex);
+        u8 *slot;
         for (auto &tlsPage: tlsPages)
-            if (!tlsPage->Full())
-                return tlsPage->ReserveSlot();
+            if ((slot = tlsPage->ReserveSlot()))
+                return slot;
 
-        u8 *ptr = tlsPages.empty() ? reinterpret_cast<u8 *>(state.process->memory.tlsIo.address) : ((*(tlsPages.end() - 1))->memory->ptr + PAGE_SIZE);
-        auto tlsPage{std::make_shared<TlsPage>(std::make_shared<KPrivateMemory>(state, ptr, PAGE_SIZE, memory::Permission(true, true, false), memory::states::ThreadLocal))};
+        slot = tlsPages.empty() ? reinterpret_cast<u8 *>(memory.tlsIo.address) : ((*(tlsPages.end() - 1))->memory->ptr + PAGE_SIZE);
+        auto tlsPage{std::make_shared<TlsPage>(std::make_shared<KPrivateMemory>(state, slot, PAGE_SIZE, memory::Permission(true, true, false), memory::states::ThreadLocal))};
         tlsPages.push_back(tlsPage);
-
-        tlsPage->ReserveSlot(); // User-mode exception handling
         return tlsPage->ReserveSlot();
     }
 
-    std::shared_ptr<KThread> KProcess::CreateThread(void *entry, u64 argument, void *stackTop, i8 priority, i8 idealCore) {
+    std::shared_ptr<KThread> KProcess::CreateThread(void *entry, u64 argument, void *stackTop, std::optional<u8> priority, std::optional<u8> idealCore) {
         std::lock_guard guard(threadMutex);
         if (disableThreadCreation)
             return nullptr;
         if (!stackTop && threads.empty()) { //!< Main thread stack is created by the kernel and owned by the process
-            mainThreadStack = mainThreadStack.make_shared(state, reinterpret_cast<u8 *>(state.process->memory.stack.address), state.process->npdm.meta.mainThreadStackSize, memory::Permission{true, true, false}, memory::states::Stack);
+            mainThreadStack = std::make_shared<KPrivateMemory>(state, reinterpret_cast<u8 *>(state.process->memory.stack.address), state.process->npdm.meta.mainThreadStackSize, memory::Permission{true, true, false}, memory::states::Stack);
             if (mprotect(mainThreadStack->ptr, PAGE_SIZE, PROT_NONE))
                 throw exception("Failed to create guard page for thread stack at 0x{:X}", mainThreadStack->ptr);
             stackTop = mainThreadStack->ptr + mainThreadStack->size;
         }
-        auto thread{NewHandle<KThread>(this, threads.size(), entry, argument, stackTop, (priority == -1) ? state.process->npdm.meta.mainThreadPriority : priority, (idealCore == -1) ? state.process->npdm.meta.idealCore : idealCore).item};
+        auto thread{NewHandle<KThread>(this, threads.size(), entry, argument, stackTop, priority ? *priority : state.process->npdm.meta.mainThreadPriority, idealCore ? *idealCore : state.process->npdm.meta.idealCore).item};
         threads.push_back(thread);
         return thread;
     }
@@ -112,175 +101,203 @@ namespace skyline::kernel::type {
         return std::nullopt;
     }
 
-    bool KProcess::MutexLock(u32 *mutex, KHandle owner) {
-        std::unique_lock lock(mutexLock);
+    constexpr u32 HandleWaitersBit{1UL << 30}; //!< A bit which denotes if a mutex psuedo-handle has waiters or not
 
-        auto &mtxWaiters{mutexes[reinterpret_cast<u64>(mutex)]};
-        if (mtxWaiters.empty()) {
-            u32 mtxExpected{};
-            if (__atomic_compare_exchange_n(mutex, &mtxExpected, (constant::MtxOwnerMask & state.thread->handle), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-                return true;
+    Result KProcess::MutexLock(u32 *mutex, KHandle ownerHandle, KHandle tag) {
+        std::shared_ptr<KThread> owner;
+        try {
+            owner = GetHandle<KThread>(ownerHandle);
+        } catch (const std::out_of_range &) {
+            return result::InvalidHandle;
         }
 
-        if (__atomic_load_n(mutex, __ATOMIC_SEQ_CST) != (owner | ~constant::MtxOwnerMask))
-            return false;
+        bool isHighestPriority;
+        {
+            std::lock_guard lock(owner->waiterMutex);
 
-        std::shared_ptr<WaitStatus> status;
-        for (auto it{mtxWaiters.begin()};; it++) {
-            if (it != mtxWaiters.end() && (*it)->priority >= state.thread->priority)
-                continue;
+            u32 value{};
+            if (__atomic_compare_exchange_n(mutex, &value, tag, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+                // We try to do a CAS to get ownership of the mutex in the case that it's unoccupied
+                return {};
+            if (value != (ownerHandle | HandleWaitersBit))
+                // We ensure that the mutex's value is the handle with the waiter bit set
+                return result::InvalidCurrentMemory;
 
-            status = std::make_shared<WaitStatus>(state.thread->priority, state.thread->handle);
-            mtxWaiters.insert(it, status);
-            break;
+            auto &waiters{owner->waiters};
+            isHighestPriority = waiters.insert(std::upper_bound(waiters.begin(), waiters.end(), state.thread->priority.load(), KThread::IsHigherPriority), state.thread) == waiters.begin();
+            state.scheduler->RemoveThread();
+
+            state.thread->waitThread = owner;
+            state.thread->waitKey = mutex;
+            state.thread->waitTag = tag;
         }
 
-        lock.unlock();
-        while (!status->flag);
-        lock.lock();
-        status->flag = false;
+        if (isHighestPriority)
+            // If we were the highest priority thread then we need to inherit priorities for all threads we're waiting on recursively
+            state.thread->UpdatePriorityInheritance();
 
-        for (auto it{mtxWaiters.begin()}; it != mtxWaiters.end(); it++) {
-            if ((*it)->handle == state.thread->handle) {
-                mtxWaiters.erase(it);
-                break;
-            }
-        }
+        state.scheduler->WaitSchedule(false);
 
-        return true;
+        return {};
     }
 
-    bool KProcess::MutexUnlock(u32 *mutex) {
-        std::unique_lock lock(mutexLock);
+    void KProcess::MutexUnlock(u32 *mutex) {
+        std::lock_guard lock(state.thread->waiterMutex);
+        auto &waiters{state.thread->waiters};
+        auto nextOwnerIt{std::find_if(waiters.begin(), waiters.end(), [mutex](const std::shared_ptr<KThread> &thread) { return thread->waitKey == mutex; })};
+        if (nextOwnerIt != waiters.end()) {
+            auto nextOwner{*nextOwnerIt};
+            std::lock_guard nextLock(nextOwner->waiterMutex);
+            nextOwner->waitThread = std::shared_ptr<KThread>{nullptr};
+            nextOwner->waitKey = nullptr;
 
-        auto &mtxWaiters{mutexes[reinterpret_cast<u64>(mutex)]};
-        u32 mtxDesired{};
-        if (!mtxWaiters.empty())
-            mtxDesired = (*mtxWaiters.begin())->handle | ((mtxWaiters.size() > 1) ? ~constant::MtxOwnerMask : 0);
+            // Move all threads waiting on this key to the next owner's waiter list
+            std::shared_ptr<KThread> nextWaiter{};
+            for (auto it{waiters.erase(nextOwnerIt)}, nextIt{std::next(it)}; it != waiters.end(); it = nextIt++) {
+                auto thread{*it};
+                if (thread->waitKey == mutex) {
+                    nextOwner->waiters.splice(std::upper_bound(nextOwner->waiters.begin(), nextOwner->waiters.end(), (*it)->priority.load(), KThread::IsHigherPriority), waiters, it);
+                    thread->waitThread = nextOwner;
+                    if (!nextWaiter)
+                        nextWaiter = thread;
+                }
+            }
 
-        u32 mtxExpected{(constant::MtxOwnerMask & state.thread->handle) | ~constant::MtxOwnerMask};
-        if (!__atomic_compare_exchange_n(mutex, &mtxExpected, mtxDesired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-            mtxExpected &= constant::MtxOwnerMask;
+            if (!waiters.empty()) {
+                // If there are threads still waiting on us then try to inherit their priority
+                auto highestPriorityThread{waiters.front()};
+                u8 newPriority, basePriority;
+                do {
+                    basePriority = state.thread->basePriority.load();
+                    newPriority = std::min(basePriority, highestPriorityThread->priority.load());
+                } while (basePriority != newPriority && state.thread->priority.compare_exchange_strong(basePriority, newPriority));
+                state.scheduler->UpdatePriority(state.thread);
+            } else {
+                u8 priority, basePriority;
+                do {
+                    basePriority = state.thread->basePriority.load();
+                    priority = state.thread->priority.load();
+                } while (priority != basePriority && !state.thread->priority.compare_exchange_strong(priority, basePriority));
+                if (priority != basePriority)
+                    state.scheduler->UpdatePriority(state.thread);
+            }
 
-            if (!__atomic_compare_exchange_n(mutex, &mtxExpected, mtxDesired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-                return false;
+            if (nextWaiter) {
+                // If there is a waiter on the new owner then try to inherit its priority
+                u8 priority, ownerPriority;
+                do {
+                    ownerPriority = nextOwner->priority.load();
+                    priority = std::min(ownerPriority, nextWaiter->priority.load());
+                } while (ownerPriority != priority && nextOwner->priority.compare_exchange_strong(ownerPriority, priority));
+
+                __atomic_store_n(mutex, nextOwner->waitTag | HandleWaitersBit, __ATOMIC_SEQ_CST);
+            } else {
+                __atomic_store_n(mutex, nextOwner->waitTag, __ATOMIC_SEQ_CST);
+            }
+
+            // Finally, schedule the next owner accordingly
+            state.scheduler->InsertThread(nextOwner);
+        } else {
+            __atomic_store_n(mutex, 0, __ATOMIC_SEQ_CST);
+        }
+    }
+
+    Result KProcess::ConditionalVariableWait(u32 *key, u32 *mutex, KHandle tag, i64 timeout) {
+        {
+            std::lock_guard lock(syncWaiterMutex);
+            auto queue{syncWaiters.equal_range(key)};
+            syncWaiters.insert(std::upper_bound(queue.first, queue.second, state.thread->priority.load(), [](const i8 priority, const SyncWaiters::value_type &it) { return it.second->priority > priority; }), {key, state.thread});
+
+            __atomic_store_n(key, true, __ATOMIC_SEQ_CST); // We need to notify any userspace threads that there are waiters on this conditional variable by writing back a boolean flag denoting it
+
+            state.scheduler->RemoveThread();
+            MutexUnlock(mutex);
         }
 
-        if (mtxDesired) {
-            auto status{(*mtxWaiters.begin())};
-            status->flag = true;
+        if (timeout > 0 && !state.scheduler->TimedWaitSchedule(std::chrono::nanoseconds(timeout))) {
+            std::unique_lock lock(syncWaiterMutex);
+            auto queue{syncWaiters.equal_range(key)};
+            auto iterator{std::find(queue.first, queue.second, SyncWaiters::value_type{key, state.thread})};
+            if (iterator != queue.second)
+                if (syncWaiters.erase(iterator) == queue.second)
+                    __atomic_store_n(key, false, __ATOMIC_SEQ_CST);
+
             lock.unlock();
-            while (status->flag);
-            lock.lock();
+            state.scheduler->InsertThread(state.thread);
+            state.scheduler->WaitSchedule();
+
+            return result::TimedOut;
+        } else {
+            state.scheduler->WaitSchedule(false);
         }
 
-        return true;
-    }
-
-    bool KProcess::ConditionalVariableWait(void *conditional, u32 *mutex, u64 timeout) {
-        std::unique_lock lock(conditionalLock);
-
-        auto &condWaiters{conditionals[reinterpret_cast<u64>(conditional)]};
-        std::shared_ptr<WaitStatus> status;
-        for (auto it{condWaiters.begin()};; it++) {
-            if (it != condWaiters.end() && (*it)->priority >= state.thread->priority)
-                continue;
-
-            status = std::make_shared<WaitStatus>(state.thread->priority, state.thread->handle, mutex);
-            condWaiters.insert(it, status);
-            break;
-        }
-
-        lock.unlock();
-
-        bool timedOut{};
-        auto start{util::GetTimeNs()};
-        while (!status->flag)
-            if ((util::GetTimeNs() - start) >= timeout)
-                timedOut = true;
-
-        lock.lock();
-
-        if (!status->flag)
-            timedOut = false;
-        else
-            status->flag = false;
-
-        for (auto it{condWaiters.begin()}; it != condWaiters.end(); it++) {
-            if ((*it)->handle == state.thread->handle) {
-                condWaiters.erase(it);
-                break;
-            }
-        }
-
-        lock.unlock();
-
-        return !timedOut;
-    }
-
-    void KProcess::ConditionalVariableSignal(void *conditional, u64 amount) {
-        std::unique_lock condLock(conditionalLock);
-
-        auto &condWaiters{conditionals[reinterpret_cast<u64>(conditional)]};
-        u64 count{};
-
-        auto iter{condWaiters.begin()};
-        while (iter != condWaiters.end() && count < amount) {
-            auto &thread{*iter};
-            auto mtx{thread->mutex};
-            u32 mtxValue{__atomic_load_n(mtx, __ATOMIC_SEQ_CST)};
-
-            while (true) {
-                u32 mtxDesired{};
-
-                if (!mtxValue)
-                    mtxDesired = (constant::MtxOwnerMask & thread->handle);
-                else if ((mtxValue & constant::MtxOwnerMask) == state.thread->handle)
-                    mtxDesired = mtxValue | (constant::MtxOwnerMask & thread->handle);
-                else if (mtxValue & ~constant::MtxOwnerMask)
-                    mtxDesired = mtxValue | ~constant::MtxOwnerMask;
-                else
-                    break;
-
-                if (__atomic_compare_exchange_n(mtx, &mtxValue, mtxDesired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-                    break;
-            }
-            if (mtxValue && ((mtxValue & constant::MtxOwnerMask) != state.thread->handle)) {
-                std::unique_lock mtxLock(mutexLock);
-
-                auto &mtxWaiters{mutexes[reinterpret_cast<u64>(thread->mutex)]};
-                std::shared_ptr<WaitStatus> status;
-
-                for (auto it{mtxWaiters.begin()};; it++) {
-                    if (it != mtxWaiters.end() && (*it)->priority >= thread->priority)
-                        continue;
-                    status = std::make_shared<WaitStatus>(thread->priority, thread->handle);
-                    mtxWaiters.insert(it, status);
-                    break;
-                }
-
-                mtxLock.unlock();
-                while (!status->flag);
-                mtxLock.lock();
-                status->flag = false;
-
-                for (auto it{mtxWaiters.begin()}; it != mtxWaiters.end(); it++) {
-                    if ((*it)->handle == thread->handle) {
-                        mtxWaiters.erase(it);
+        KHandle value{};
+        if (!__atomic_compare_exchange_n(mutex, &value, tag, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            while (MutexLock(mutex, value & ~HandleWaitersBit, tag) != Result{})
+                if ((value = __atomic_or_fetch(mutex, HandleWaitersBit, __ATOMIC_SEQ_CST)) == HandleWaitersBit)
+                    if (__atomic_compare_exchange_n(mutex, &value, tag, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
                         break;
-                    }
-                }
 
-                mtxLock.unlock();
+        return {};
+    }
+
+    void KProcess::ConditionalVariableSignal(u32 *key, i32 amount) {
+        std::lock_guard lock(syncWaiterMutex);
+        auto queue{syncWaiters.equal_range(key)};
+
+        auto it{queue.first};
+        for (i32 waiterCount{amount}; it != queue.second && (amount <= 0 || waiterCount); it = syncWaiters.erase(it), waiterCount--)
+            state.scheduler->InsertThread(it->second);
+
+        if (it == queue.second)
+            __atomic_store_n(key, false, __ATOMIC_SEQ_CST); // We need to update the boolean flag denoting that there are no more threads waiting on this conditional variable
+    }
+
+    Result KProcess::WaitForAddress(u32 *address, u32 value, i64 timeout, bool (*arbitrationFunction)(u32 *, u32)) {
+        {
+            std::lock_guard lock(syncWaiterMutex);
+            if (!arbitrationFunction(address, value)) [[unlikely]]
+                return result::InvalidState;
+
+            auto queue{syncWaiters.equal_range(address)};
+            syncWaiters.insert(std::upper_bound(queue.first, queue.second, state.thread->priority.load(), [](const i8 priority, const SyncWaiters::value_type &it) { return it.second->priority > priority; }), {address, state.thread});
+
+            state.scheduler->RemoveThread();
+        }
+
+        if (timeout > 0 && !state.scheduler->TimedWaitSchedule(std::chrono::nanoseconds(timeout))) {
+            {
+                std::lock_guard lock(syncWaiterMutex);
+                auto queue{syncWaiters.equal_range(address)};
+                auto iterator{std::find(queue.first, queue.second, SyncWaiters::value_type{address, state.thread})};
+                if (iterator != queue.second)
+                    if (syncWaiters.erase(iterator) == queue.second)
+                        __atomic_store_n(address, false, __ATOMIC_SEQ_CST);
             }
 
-            thread->flag = true;
-            iter++;
-            count++;
+            state.scheduler->InsertThread(state.thread);
+            state.scheduler->WaitSchedule();
 
-            condLock.unlock();
-            while (thread->flag);
-            condLock.lock();
+            return result::TimedOut;
+        } else {
+            state.scheduler->WaitSchedule(false);
         }
+
+        return {};
+    }
+
+    Result KProcess::SignalToAddress(u32 *address, u32 value, i32 amount, bool(*mutateFunction)(u32 *address, u32 value, u32 waiterCount)) {
+        std::lock_guard lock(syncWaiterMutex);
+        auto queue{syncWaiters.equal_range(address)};
+
+        if (mutateFunction)
+            if (!mutateFunction(address, value, (amount <= 0) ? 0 : std::min(static_cast<u32>(std::distance(queue.first, queue.second) - amount), 0U))) [[unlikely]]
+                return result::InvalidState;
+
+        i32 waiterCount{amount};
+        for (auto it{queue.first}; it != queue.second && (amount <= 0 || waiterCount); it = syncWaiters.erase(it), waiterCount--)
+            state.scheduler->InsertThread(it->second);
+
+        return {};
     }
 }
